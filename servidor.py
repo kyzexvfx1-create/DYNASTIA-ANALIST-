@@ -46,7 +46,17 @@ from urllib.parse import urlparse, parse_qs
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 
-PUERTO = 8787
+# PUERTO: en local se usa 8787 de siempre. En Render/Railway viene dado por
+# la variable de entorno PORT, así que se respeta si existe.
+PUERTO = int(os.environ.get("PORT", 8787))
+# HOST: 127.0.0.1 en local (como siempre). En Render/Railway hace falta
+# 0.0.0.0 para que la plataforma pueda alcanzar el proceso desde fuera;
+# se detecta automáticamente, o se puede forzar a mano con HOST=0.0.0.0.
+HOST = os.environ.get(
+    "HOST",
+    "0.0.0.0" if os.environ.get("RENDER") or os.environ.get("RAILWAY_ENVIRONMENT")
+    else "127.0.0.1"
+)
 RAIZ = os.path.dirname(os.path.abspath(__file__))
 PAGINA = "crypto-ops-center.html"
 PAGINA_FX = "forex-ops-center.html"
@@ -3484,16 +3494,19 @@ class Handler(SimpleHTTPRequestHandler):
 
 
 def main():
+    en_local = HOST == "127.0.0.1"
     if not os.path.exists(os.path.join(RAIZ, PAGINA)):
         print("\n  No encuentro %s en esta carpeta.\n" % PAGINA)
-        input("  Pulsa Intro para cerrar...")
+        if en_local:
+            input("  Pulsa Intro para cerrar...")
         return
     try:
-        srv = ThreadingHTTPServer(("127.0.0.1", PUERTO), Handler)
+        srv = ThreadingHTTPServer((HOST, PUERTO), Handler)
     except OSError:
         print("\n  El puerto %d ya esta ocupado: el panel ya debe estar abierto.\n" % PUERTO)
-        webbrowser.open("http://127.0.0.1:%d/" % PUERTO)
-        input("  Pulsa Intro para cerrar...")
+        if en_local:
+            webbrowser.open("http://127.0.0.1:%d/" % PUERTO)
+            input("  Pulsa Intro para cerrar...")
         return
 
     srv.daemon_threads = True
@@ -3558,23 +3571,27 @@ def main():
             print("     %s" % linea)
     if avisos:
         print("")
-    print("  Escucha:    solo 127.0.0.1 · la clave nunca sale hacia el panel")
+    if en_local:
+        print("  Escucha:    solo 127.0.0.1 · la clave nunca sale hacia el panel")
+    else:
+        print("  Escucha:    %s:%d · modo remoto (HOST=%s)" % (HOST, PUERTO, HOST))
     print("-" * 62)
     print("  Deja esta ventana abierta. Para cerrar: Control+C\n")
 
     for f in (bucle_noticias, bucle_listados, bucle_calendario, bucle_tesorerias, bucle_ballenas,
               bucle_fx, bucle_trump, bucle_cotizaciones, bucle_comparativa, bucle_analisis, bucle_memoria):
         threading.Thread(target=f, daemon=True).start()
-    def abrir_cuando_listo():
-        import urllib.request as _u
-        for _ in range(40):
-            try:
-                _u.urlopen(base + "/api/ping", timeout=1).read()
-                break
-            except Exception:
-                time.sleep(0.25)
-        webbrowser.open(url)
-    threading.Thread(target=abrir_cuando_listo, daemon=True).start()
+    if en_local:
+        def abrir_cuando_listo():
+            import urllib.request as _u
+            for _ in range(40):
+                try:
+                    _u.urlopen(base + "/api/ping", timeout=1).read()
+                    break
+                except Exception:
+                    time.sleep(0.25)
+            webbrowser.open(url)
+        threading.Thread(target=abrir_cuando_listo, daemon=True).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
