@@ -1336,7 +1336,7 @@ function esperandoServidor() {
   const aviso = '<div class="empty"><b>Esperando el primer sondeo del servidor</b>' +
     'El servidor está consultando las 59 fuentes por primera vez; tarda hasta 45 segundos. ' +
     'Mientras tanto se consulta también desde el navegador, así que algo debería aparecer antes.</div>';
-  if (!S.news.length) { $('#nList').innerHTML = aviso; $('#topNews').innerHTML = aviso; }
+  if (!S.news.length) { $('#nList').innerHTML = aviso; if ($('#topNews')) $('#topNews').innerHTML = aviso; }
   if (!S.listings.length) $('#lstMini').innerHTML = aviso;
   if (!S.cal || !S.cal.length) $('#calList').innerHTML = aviso;
 }
@@ -1586,8 +1586,8 @@ window.pick = s => { S.anl.sym = s; S.anl.data = null; go('anl'); $('#anSel').va
 /* ---------- HALVING Y AGENDA ---------- */
 const HB = 1050000, ANC = { h: 962231, t: Date.UTC(2026, 7, 13) };
 async function loadHeight() {
-  try { const r = await fetch('https://mempool.space/api/blocks/tip/height', { cache: 'no-store' }); S.height = parseInt(await r.text(), 10); $('#hvSrc').textContent = 'mempool.space'; }
-  catch (e) { S.height = ANC.h + Math.floor((Date.now() - ANC.t) / 6e5); $('#hvSrc').textContent = 'estimado'; }
+  try { const r = await fetch('https://mempool.space/api/blocks/tip/height', { cache: 'no-store' }); S.height = parseInt(await r.text(), 10); if ($('#hvSrc')) $('#hvSrc').textContent = 'mempool.space'; }
+  catch (e) { S.height = ANC.h + Math.floor((Date.now() - ANC.t) / 6e5); if ($('#hvSrc')) $('#hvSrc').textContent = 'estimado'; }
   tickHv();
 }
 function tickHv() {
@@ -2665,8 +2665,10 @@ function renderNews() {
   $('#nList').innerHTML = l.length ? l.map(nwHTML).join('') : '<div class="empty"><b>Sin titulares</b>Arranca el lanzador para un enlace estable.</div>';
 }
 function renderTopNews() {
+  const el = $('#topNews');
+  if (!el) return; // el contenedor #topNews no existe en este HTML; se omite sin romper el resto
   const l = S.news.filter(n => n.imp >= 2).slice(0, 12);
-  $('#topNews').innerHTML = l.length ? l.map(nwHTML).join('') : '<div class="empty">Sin titulares de alto impacto</div>';
+  el.innerHTML = l.length ? l.map(nwHTML).join('') : '<div class="empty">Sin titulares de alto impacto</div>';
 }
 
 /* ==========================================================================
