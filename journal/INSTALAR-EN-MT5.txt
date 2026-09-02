@@ -1,0 +1,98 @@
+JOURNAL DE LA ACADEMIA · CONEXIÓN CON METATRADER 5
+==================================================
+
+QUÉ HACE
+- Detecta las posiciones que cierras en MetaTrader 5 y las envía al Journal.
+- Manda: activo, dirección, fecha y hora, entrada, salida, volumen, stop,
+  objetivo, distancia del stop en pips, duración, beneficio, comisión, swap,
+  tasas, riesgo en dinero y en porcentaje, resultado en R, R:R previsto y
+  motivo de cierre (stop, objetivo o manual).
+- NO abre, NO modifica y NO cierra operaciones. El código no contiene ni una
+  llamada a OrderSend: compruébalo buscando esa palabra en el archivo.
+- NO envía contraseñas. El experto no las conoce.
+
+
+ANTES DE EMPEZAR
+No hace falta instalar nada. MetaEditor, que es lo que compila el experto,
+viene incluido con MetaTrader 5: se abre con la tecla F4.
+
+
+PASO 1 · AUTORIZAR LA DIRECCIÓN
+1. En MetaTrader 5: Herramientas > Opciones.
+2. Pestaña "Asesores Expertos".
+3. Marca "Permitir WebRequest para las siguientes URL".
+4. Pulsa + y añade la dirección EXACTA que te haya dado la academia,
+   sin barra al final. Para la prueba en tu propio ordenador:
+
+   http://127.0.0.1:8787
+
+5. Aceptar.
+
+Si te saltas este paso verás el error 4014 o 5200 en el registro.
+
+
+PASO 2 · COPIAR EL ARCHIVO
+1. En MetaTrader 5: Archivo > Abrir carpeta de datos.
+2. Entra en la carpeta MQL5 y después en Experts.
+3. Copia ahí JournalAcademia.mq5.
+
+
+PASO 3 · COMPILAR
+1. Vuelve a MetaTrader 5 y pulsa F4. Se abre MetaEditor.
+2. En el panel de la izquierda, despliega Experts y haz doble clic en
+   JournalAcademia.mq5.
+3. Pulsa F7.
+4. Abajo debe aparecer "0 errores". Los avisos ("warnings") no impiden usarlo.
+
+
+PASO 4 · ACTIVAR
+1. Vuelve a MetaTrader 5.
+2. Pulsa Ctrl+N para abrir el Navegador.
+3. En Asesores Expertos, clic derecho > Actualizar.
+4. Arrastra JournalAcademia a cualquier gráfico QUE VAYAS A DEJAR ABIERTO.
+   Da igual el par: el experto lee el historial de la cuenta entera, no el
+   del gráfico donde esté.
+5. En la ventana que aparece, pega tu CÓDIGO DE VINCULACIÓN y comprueba la
+   dirección del servidor.
+6. Activa el botón "Algo Trading" de la barra superior.
+
+
+COMPROBACIÓN
+- En la esquina del gráfico aparece un recuadro con el número de cuenta y
+  "Estado: activo · solo lectura".
+- En la pestaña "Expertos" de MetaTrader verás las líneas del envío.
+- La primera sincronización puede traer hasta un año de historial. Va en
+  tandas de 40 operaciones para no bloquear el terminal, así que si tienes
+  mucho histórico tardará unos minutos.
+
+
+AJUSTES QUE PUEDES CAMBIAR
+  DiasHistorico     Cuánto historial se importa la primera vez. Por defecto 365.
+  SegundosSincro    Cada cuánto revisa. Por defecto 15.
+  MaxPorCiclo       Operaciones por envío. Bájalo si notas el terminal lento.
+  EtiquetaCuenta    Un nombre para distinguir esta cuenta de otras tuyas.
+  ImportarHistorico Ponlo en false si solo quieres las operaciones nuevas.
+  ReenviarTodo      Ponlo en true UNA vez para reimportar todo, y vuelve a
+                    dejarlo en false. No se duplica nada.
+
+
+VARIAS CUENTAS
+Instala el experto en cada terminal. Todas pueden enviar al mismo sitio: cada
+operación se identifica por servidor + cuenta + número de posición, así que
+dos cuentas distintas nunca se pisan aunque coincida el número.
+
+
+SI NO CONECTA
+1. ¿Está el botón "Algo Trading" activado?
+2. ¿La dirección autorizada es EXACTAMENTE la del experto, sin barra final?
+3. Mira las pestañas "Expertos" y "Diario" de MetaTrader: el mensaje de error
+   dice qué falla.
+4. Error 4014 o 5200 = falta autorizar la dirección (paso 1).
+5. Respuesta 401 o 403 = el código de vinculación no es válido. Genera uno
+   nuevo en la plataforma.
+
+
+UNA NOTA SOBRE EL RIESGO Y LA R
+El riesgo en dinero y el resultado en R solo se pueden calcular si la
+operación tenía stop puesto al abrir. Si operabas sin stop, esos campos
+aparecerán en cero. No es un fallo del conector.

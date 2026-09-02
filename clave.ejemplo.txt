@@ -1,0 +1,41 @@
+# ---------------------------------------------------------------------------
+#  PLANTILLA DE CONFIGURACION
+#
+#  Copia este archivo como  clave.txt  en la misma carpeta que servidor.py
+#  y sustituye los valores. clave.txt esta en .gitignore y NO se sube nunca.
+#
+#  Formato: una directiva por linea, valores separados por espacios.
+#  Todo lo que empiece por # se ignora.
+#  El archivo se lee SOLO AL ARRANCAR: si lo cambias, reinicia el servidor.
+# ---------------------------------------------------------------------------
+
+# Clave de la API de Anthropic. Se saca de console.anthropic.com.
+# Sin esta linea el terminal funciona, pero sin sesgo, chat ni explicaciones.
+anthropic TU_CLAVE_DE_ANTHROPIC
+
+# Modelo por defecto (opcional). Si no se pone, usa el reparto por tarea
+# definido en servidor.py: Opus para el sesgo, Sonnet para los analisis,
+# Haiku para el chat.
+# modelo claude-sonnet-5
+
+# Acceso con Discord: CLIENT_ID, CLIENT_SECRET e ID DEL SERVIDOR.
+# Ojo: el tercer valor es el ID del servidor de Discord (clic derecho sobre el
+# icono del servidor), NO el de la aplicacion. Es el error mas comun y deja
+# a todo el mundo fuera.
+# Mientras no exista esta linea, el terminal se abre sin login: util en local.
+discord CLIENT_ID CLIENT_SECRET ID_DEL_SERVIDOR
+
+# Exigir ademas un rol concreto (opcional). Varios separados por comas.
+# Si no se pone, basta con pertenecer al servidor.
+# NO dejes numeros de ejemplo aqui: bloquearia a todo el mundo.
+# discord_roles ID_DE_ROL
+
+# Dominio publico. En local NO la pongas: sin ella el retorno de Discord va a
+# 127.0.0.1 y funciona. Se anade cuando el dominio ya apunta al servidor.
+# dominio https://analyst.dynastia.es
+
+# Canal de Tickets: URL del webhook del canal de Discord.
+# tickets https://discord.com/api/webhooks/...
+
+# Correo alternativo para los tickets (opcional).
+# soporte_correo soporte@dynastia.es
