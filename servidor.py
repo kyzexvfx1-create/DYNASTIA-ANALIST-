@@ -166,6 +166,10 @@ def cargar_clave():
                     SOPORTE["webhook"] = v.strip()
                 elif k == "soporte_correo":
                     SOPORTE["correo"] = v.strip()
+                elif k == "stripe_enlace":
+                    STRIPE["enlace"] = v.strip()
+                elif k == "stripe_webhook":
+                    STRIPE["webhook"] = v.strip()
         except Exception as e:                           # noqa: BLE001
             print("  aviso: no se pudo leer clave.txt (%s)" % e)
     if not clave:
@@ -288,7 +292,9 @@ VIDA_SESION = 30 * 86400
 ESTADOS_OAUTH = {}               # state -> caducidad
 
 RUTAS_LIBRES = ("/login", "/auth/discord", "/auth/discord/callback", "/logout",
-                "/api/ping", "/api/acceso", "/favicon.ico")
+                "/api/ping", "/api/acceso", "/favicon.ico",
+                "/api/registro", "/api/login", "/stripe/webhook",
+                "/pago", "/pago/completado")
 
 
 def discord_activo():
@@ -346,6 +352,226 @@ def sesion_de(handler):
             SESIONES.pop(tok, None)
             return None
     return d
+
+
+# --------------------------------------------------------------------------
+#  CUENTAS PROPIAS + PAGO CON STRIPE (30E/mes)
+#
+#  Registro e inicio de sesion con correo y contrasena, sin depender de
+#  Discord. Al entrar sin una suscripcion activa, se manda a /pago, que
+#  lleva al enlace de Stripe ya creado. En cuanto Stripe confirma el
+#  cobro, el webhook activa el acceso 31 dias; si cancela o falla un
+#  cobro, se retira solo. Se guarda junto al servidor, en usuarios.json y
+#  pagos.json, asi que sobrevive a reinicios.
+#
+#  Se configura en clave.txt, que NUNCA se comparte:
+#      stripe_enlace https://buy.stripe.com/xxxxx
+#      stripe_webhook whsec_...
+#
+#  Si no hay ni Discord ni Stripe configurados y no existe ninguna cuenta
+#  todavia, el acceso queda abierto: el uso local de siempre sigue
+#  funcionando sin tocar nada.
+# --------------------------------------------------------------------------
+import uuid as _uuid                                     # noqa: E402
+
+STRIPE = {"enlace": "", "webhook": ""}
+USUARIOS_ARCHIVO = os.path.join(RAIZ, "usuarios.json")
+PAGOS_ARCHIVO = os.path.join(RAIZ, "pagos.json")
+_LOCK_CUENTAS = threading.Lock()
+
+
+def _carga_json(ruta, por_defecto):
+    if not os.path.exists(ruta):
+        return por_defecto
+    try:
+        with open(ruta, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:                                    # noqa: BLE001
+        return por_defecto
+
+
+def _guarda_json(ruta, datos):
+    tmp = ruta + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(datos, f, ensure_ascii=False)
+    os.replace(tmp, ruta)                                # escritura atomica
+
+
+def usuarios_carga():
+    return _carga_json(USUARIOS_ARCHIVO, {})             # correo -> ficha
+
+
+def pagos_carga():
+    return _carga_json(PAGOS_ARCHIVO, {})                # id_usuario -> ficha
+
+
+def stripe_activo():
+    return bool(STRIPE["enlace"] and STRIPE["webhook"])
+
+
+def login_activo():
+    """Hay puerta de entrada si Discord o Stripe estan configurados, o si
+    ya existe alguna cuenta creada (para no dejarla huerfana si se borran
+    las claves despues)."""
+    return discord_activo() or stripe_activo() or bool(usuarios_carga())
+
+
+def _hash_clave(clave, sal=None):
+    sal = sal or os.urandom(16)
+    h = hashlib.pbkdf2_hmac("sha256", clave.encode("utf-8"), sal, 200_000)
+    return sal.hex(), h.hex()
+
+
+def _verifica_clave(clave, sal_hex, hash_hex):
+    try:
+        sal = bytes.fromhex(sal_hex)
+    except ValueError:
+        return False
+    _, h = _hash_clave(clave, sal)
+    return hmac.compare_digest(h, hash_hex)
+
+
+def pago_activo(id_usuario):
+    ficha = pagos_carga().get(id_usuario or "", {})
+    return bool(ficha.get("activo") and ficha.get("hasta", 0) > time.time())
+
+
+def _requiere_pago(ficha_sesion):
+    """Solo las cuentas propias pasan por el muro de pago. El acceso via
+    Discord sigue su propia logica de siempre (servidor/rol), sin tocarla."""
+    return bool(ficha_sesion) and ficha_sesion.get("tipo") == "nativo" \
+        and stripe_activo() and not pago_activo(ficha_sesion.get("id", ""))
+
+
+def _uid_por_customer(customer_id):
+    if not customer_id:
+        return ""
+    for uid, ficha in pagos_carga().items():
+        if ficha.get("customer") == customer_id:
+            return uid
+    return ""
+
+
+def _verifica_firma_stripe(cuerpo, cabecera_firma, secreto, tolerancia=300):
+    """Verifica la cabecera Stripe-Signature: 't=<epoch>,v1=<hmac_hex>'.
+
+    La firma valida es HMAC-SHA256 de '<epoch>.<cuerpo>' con el secreto
+    del webhook (whsec_...). Si no coincide ninguna firma v1, o el
+    instante es demasiado viejo, se rechaza.
+    """
+    if not secreto or not cabecera_firma:
+        return False
+    pares = [p.split("=", 1) for p in cabecera_firma.split(",") if "=" in p]
+    ts = next((v for k, v in pares if k == "t"), "")
+    firmas = [v for k, v in pares if k == "v1"]
+    if not ts or not firmas:
+        return False
+    try:
+        if abs(time.time() - int(ts)) > tolerancia:
+            return False
+    except ValueError:
+        return False
+    esperado = hmac.new(secreto.encode("utf-8"),
+                         (ts + "." + cuerpo.decode("utf-8", "replace")).encode("utf-8"),
+                         hashlib.sha256).hexdigest()
+    return any(hmac.compare_digest(esperado, f) for f in firmas)
+
+
+def _procesa_evento_stripe(evento):
+    tipo = evento.get("type", "")
+    obj = (evento.get("data") or {}).get("object") or {}
+    uid = obj.get("client_reference_id") or _uid_por_customer(obj.get("customer", ""))
+    if not uid:
+        return
+    with _LOCK_CUENTAS:
+        pagos = pagos_carga()
+        ficha = pagos.get(uid, {})
+        if tipo in ("checkout.session.completed", "invoice.paid"):
+            ficha["activo"] = True
+            ficha["hasta"] = time.time() + 31 * 86400
+            if obj.get("customer"):
+                ficha["customer"] = obj["customer"]
+        elif tipo in ("customer.subscription.deleted", "invoice.payment_failed"):
+            ficha["activo"] = False
+        pagos[uid] = ficha
+        _guarda_json(PAGOS_ARCHIVO, pagos)
+    print("  pago      %s -> %s" % (tipo, uid))
+    sys.stdout.flush()
+
+
+PAGINA_CUENTA = """<!doctype html><html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Dynastia Analyst</title>
+<style>
+  body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+    background:#0a0e0f;color:#d9e4e2;font-family:-apple-system,sans-serif}
+  .caja{width:340px;padding:28px}
+  h1{font-size:16px;margin:0 0 4px}
+  p.sub{color:#5f7876;font-size:12.5px;margin:0 0 22px}
+  .pestanas{display:flex;gap:6px;margin-bottom:18px}
+  .pestanas button{flex:1;background:none;border:1px solid #1b2426;color:#5f7876;
+    padding:8px;border-radius:8px;cursor:pointer;font-size:13px;font-family:inherit}
+  .pestanas button.on{background:#0e1416;color:#d9e4e2;border-color:#e8b64f}
+  input{width:100%;box-sizing:border-box;background:#0e1416;border:1px solid #1b2426;
+    color:#d9e4e2;padding:10px 12px;border-radius:8px;font-size:13.5px;margin-bottom:10px}
+  button.env{width:100%;background:#e8b64f;color:#0a0e0f;border:none;padding:10px;
+    border-radius:8px;font-size:13.5px;font-weight:600;cursor:pointer;font-family:inherit}
+  .e{color:#e8615c;font-size:12.5px;margin-bottom:10px;min-height:16px}
+</style></head><body>
+<div class="caja">
+  <h1>Dynastia Analyst</h1>
+  <p class="sub">Terminal de mercado &middot; acceso por suscripcion</p>
+  <div class="pestanas">
+    <button id="tIn" class="on">Iniciar sesion</button>
+    <button id="tUp">Crear cuenta</button>
+  </div>
+  <div class="e" id="err"></div>
+  <input id="email" type="email" placeholder="Correo electronico" autocomplete="username">
+  <input id="clave" type="password" placeholder="Contrasena" autocomplete="current-password">
+  <button class="env" id="ir">Entrar</button>
+</div>
+<script>
+let modo = "login";
+const $ = s => document.querySelector(s);
+$("#tIn").onclick = () => { modo = "login"; $("#tIn").classList.add("on"); $("#tUp").classList.remove("on"); $("#ir").textContent = "Entrar"; };
+$("#tUp").onclick = () => { modo = "registro"; $("#tUp").classList.add("on"); $("#tIn").classList.remove("on"); $("#ir").textContent = "Crear cuenta"; };
+$("#ir").onclick = async () => {
+  $("#err").textContent = "";
+  const email = $("#email").value.trim(), clave = $("#clave").value;
+  if (!email || clave.length < 6) { $("#err").textContent = "Correo valido y contrasena de 6 caracteres o mas."; return; }
+  const ruta = modo === "login" ? "/api/login" : "/api/registro";
+  try {
+    const r = await fetch(ruta, { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, clave }) });
+    const d = await r.json();
+    if (!r.ok) { $("#err").textContent = d.error || "No se pudo continuar."; return; }
+    location.href = "/";
+  } catch (e) { $("#err").textContent = "Fallo de conexion. Intentalo de nuevo."; }
+};
+</script></body></html>"""
+
+
+PAGINA_PAGO = """<!doctype html><html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Dynastia Analyst - Suscripcion</title>
+<style>
+  body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+    background:#0a0e0f;color:#d9e4e2;font-family:-apple-system,sans-serif;text-align:center}
+  .caja{width:360px;padding:28px}
+  h1{font-size:17px;margin:0 0 8px}
+  p{color:#8b93a3;font-size:13px;line-height:1.5;margin:0 0 22px}
+  a.btn{display:inline-block;background:#e8b64f;color:#0a0e0f;padding:12px 26px;
+    border-radius:8px;text-decoration:none;font-size:14px;font-weight:600}
+  a.salir{display:block;margin-top:18px;color:#5f7876;font-size:12px}
+</style></head><body>
+<div class="caja">
+  <h1>Falta activar tu suscripcion</h1>
+  <p>El acceso al terminal es de 30&euro; al mes. En cuanto Stripe confirma el
+     pago, entras al instante, sin tener que recargar nada.</p>
+  <a class="btn" href="__ENLACE__">Suscribirme por 30&euro;/mes</a>
+  <a class="salir" href="/logout">Cerrar sesion</a>
+</div>
+</body></html>"""
 
 
 def _post_form(url, datos):
@@ -2878,8 +3104,90 @@ class Handler(SimpleHTTPRequestHandler):
 
         # Misma puerta en las escrituras. El EA entra con su propio codigo de
         # vinculacion, no con sesion de navegador.
-        if discord_activo() and not ruta.startswith("/ea/v1/") and not sesion_de(self):
+        ses = sesion_de(self)
+        if login_activo() and not ruta.startswith("/ea/v1/") \
+                and ruta not in RUTAS_LIBRES and not ses:
             return self._j(401, {"error": "sesion no valida", "login": "/login"})
+        if ses and _requiere_pago(ses) and ruta not in RUTAS_LIBRES:
+            return self._j(402, {"error": "sin suscripcion activa", "pago": "/pago"})
+
+        if ruta == "/api/registro":
+            try:
+                n = int(self.headers.get("Content-Length", 0))
+                d = json.loads(self.rfile.read(n) or b"{}")
+            except Exception:                            # noqa: BLE001
+                return self._j(400, {"error": "Cuerpo no valido"})
+            email = (d.get("email") or "").strip().lower()
+            clave = d.get("clave") or ""
+            if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+                return self._j(400, {"error": "Correo no valido"})
+            if len(clave) < 6:
+                return self._j(400, {"error": "La contrasena necesita 6 caracteres o mas"})
+            with _LOCK_CUENTAS:
+                usuarios = usuarios_carga()
+                if email in usuarios:
+                    return self._j(409, {"error": "Ya existe una cuenta con ese correo"})
+                sal, h = _hash_clave(clave)
+                uid = _uuid.uuid4().hex
+                usuarios[email] = {"id": uid, "sal": sal, "hash": h, "creada": time.time()}
+                _guarda_json(USUARIOS_ARCHIVO, usuarios)
+            ficha = {"id": uid, "email": email, "nombre": email.split("@")[0], "tipo": "nativo"}
+            tok = nueva_sesion(ficha)
+            print("  cuenta    nueva %s" % email)
+            sys.stdout.flush()
+            b = json.dumps({"ok": True}).encode("utf-8")
+            self.send_response(200)
+            seguro = "; Secure" if _base_url(self).startswith("https") else ""
+            self.send_header("Set-Cookie", "dyn_sesion=%s; Path=/; HttpOnly; SameSite=Lax; Max-Age=%d%s"
+                             % (tok, VIDA_SESION, seguro))
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+            return
+
+        if ruta == "/api/login":
+            try:
+                n = int(self.headers.get("Content-Length", 0))
+                d = json.loads(self.rfile.read(n) or b"{}")
+            except Exception:                            # noqa: BLE001
+                return self._j(400, {"error": "Cuerpo no valido"})
+            email = (d.get("email") or "").strip().lower()
+            clave = d.get("clave") or ""
+            ficha_u = usuarios_carga().get(email)
+            if not ficha_u or not _verifica_clave(clave, ficha_u["sal"], ficha_u["hash"]):
+                return self._j(401, {"error": "Correo o contrasena incorrectos"})
+            ficha = {"id": ficha_u["id"], "email": email, "nombre": email.split("@")[0], "tipo": "nativo"}
+            tok = nueva_sesion(ficha)
+            print("  cuenta    entra %s" % email)
+            sys.stdout.flush()
+            b = json.dumps({"ok": True}).encode("utf-8")
+            self.send_response(200)
+            seguro = "; Secure" if _base_url(self).startswith("https") else ""
+            self.send_header("Set-Cookie", "dyn_sesion=%s; Path=/; HttpOnly; SameSite=Lax; Max-Age=%d%s"
+                             % (tok, VIDA_SESION, seguro))
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+            return
+
+        if ruta == "/stripe/webhook":
+            try:
+                n = int(self.headers.get("Content-Length", 0))
+                cuerpo = self.rfile.read(n)
+            except Exception:                            # noqa: BLE001
+                return self._j(400, {"error": "Cuerpo no valido"})
+            firma = self.headers.get("Stripe-Signature", "")
+            if not _verifica_firma_stripe(cuerpo, firma, STRIPE["webhook"]):
+                return self._j(400, {"error": "Firma no valida"})
+            try:
+                evento = json.loads(cuerpo)
+            except Exception:                            # noqa: BLE001
+                return self._j(400, {"error": "JSON no valido"})
+            _procesa_evento_stripe(evento)
+            return self._j(200, {"ok": True})
+
         if ruta == "/api/traspaso":
             try:
                 n = int(self.headers.get("Content-Length", 0))
@@ -3216,15 +3524,38 @@ class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
         ruta = urlparse(self.path)
 
-        # La puerta. Sin Discord configurado no hay puerta: el uso local de
-        # siempre sigue funcionando igual.
-        if discord_activo() and not ruta.path.startswith("/ea/v1/") \
-                and ruta.path not in RUTAS_LIBRES and not sesion_de(self):
+        # La puerta. Sin Discord ni Stripe configurados, y sin ninguna
+        # cuenta creada todavia, no hay puerta: el uso local de siempre
+        # sigue funcionando igual.
+        ses = sesion_de(self)
+        if login_activo() and not ruta.path.startswith("/ea/v1/") \
+                and ruta.path not in RUTAS_LIBRES and not ses:
             if ruta.path.startswith("/api/"):
                 return self._j(401, {"error": "sesion no valida", "login": "/login"})
             return self._redir("/login")
 
+        # El muro de pago. Solo afecta a las cuentas propias (no a Discord,
+        # que sigue su logica de siempre): con sesion pero sin suscripcion
+        # activa, todo el sitio menos /pago y logout queda bloqueado.
+        if ses and _requiere_pago(ses) and ruta.path not in RUTAS_LIBRES:
+            if ruta.path.startswith("/api/"):
+                return self._j(402, {"error": "sin suscripcion activa", "pago": "/pago"})
+            return self._redir("/pago")
+
         # ---------------- ACCESO ----------------
+        if ruta.path == "/login" and not discord_activo():
+            return self._html(PAGINA_CUENTA)
+
+        if ruta.path == "/pago":
+            if not ses:
+                return self._redir("/login")
+            enlace = STRIPE["enlace"] + (("&" if "?" in STRIPE["enlace"] else "?")
+                                          + "client_reference_id=" + ses.get("id", ""))
+            return self._html(PAGINA_PAGO.replace("__ENLACE__", enlace))
+
+        if ruta.path == "/pago/completado":
+            return self._redir("/")
+
         if ruta.path == "/login":
             err = (parse_qs(ruta.query).get("e") or [""])[0]
             MENS = {"nomiembro": "Tu cuenta de Discord no esta en el servidor de la "
@@ -3551,6 +3882,14 @@ def main():
     else:
         print("  Soporte:    SIN CONFIGURAR · anade en clave.txt una linea:")
         print("              tickets https://discord.com/api/webhooks/...")
+
+    if stripe_activo():
+        print("  Pago:       Stripe · 30E/mes · cuentas propias (sin Discord)")
+        print("              webhook: %s/stripe/webhook" % (DISCORD["dominio"] or retorno_local().replace("/auth/discord/callback", "")))
+    else:
+        print("  Pago:       SIN CONFIGURAR · anade en clave.txt:")
+        print("              stripe_enlace https://buy.stripe.com/...")
+        print("              stripe_webhook whsec_...")
     avisos = revisa_discord()
     if discord_activo():
         print("  Acceso:     Discord · solo miembros del servidor %s" % DISCORD["guild"])
