@@ -170,6 +170,10 @@ def cargar_clave():
                     STRIPE["enlace"] = v.strip()
                 elif k == "stripe_webhook":
                     STRIPE["webhook"] = v.strip()
+                elif k == "stripe_boton":
+                    STRIPE["boton"] = v.strip()
+                elif k == "stripe_publicable":
+                    STRIPE["publicable"] = v.strip()
         except Exception as e:                           # noqa: BLE001
             print("  aviso: no se pudo leer clave.txt (%s)" % e)
     if not clave:
@@ -374,7 +378,7 @@ def sesion_de(handler):
 # --------------------------------------------------------------------------
 import uuid as _uuid                                     # noqa: E402
 
-STRIPE = {"enlace": "", "webhook": ""}
+STRIPE = {"enlace": "", "webhook": "", "boton": "", "publicable": ""}
 USUARIOS_ARCHIVO = os.path.join(RAIZ, "usuarios.json")
 PAGOS_ARCHIVO = os.path.join(RAIZ, "pagos.json")
 _LOCK_CUENTAS = threading.Lock()
@@ -405,8 +409,14 @@ def pagos_carga():
     return _carga_json(PAGOS_ARCHIVO, {})                # id_usuario -> ficha
 
 
+def stripe_boton_activo():
+    return bool(STRIPE["boton"] and STRIPE["publicable"])
+
+
 def stripe_activo():
-    return bool(STRIPE["enlace"] and STRIPE["webhook"])
+    """Hace falta el webhook (sin el, el cobro no activa nada) y alguna
+    forma de cobrar: el boton embebido o, si no, el enlace de siempre."""
+    return bool(STRIPE["webhook"]) and (stripe_boton_activo() or bool(STRIPE["enlace"]))
 
 
 def login_activo():
@@ -414,6 +424,13 @@ def login_activo():
     ya existe alguna cuenta creada (para no dejarla huerfana si se borran
     las claves despues)."""
     return discord_activo() or stripe_activo() or bool(usuarios_carga())
+
+
+def _escapa_attr(valor):
+    """Escapa un valor para meterlo dentro de un atributo HTML entre
+    comillas dobles, para que nada de lo que venga pueda romper la etiqueta."""
+    return (str(valor or "").replace("&", "&amp;").replace('"', "&quot;")
+            .replace("<", "&lt;").replace(">", "&gt;"))
 
 
 def _hash_clave(clave, sal=None):
@@ -554,23 +571,48 @@ $("#ir").onclick = async () => {
 PAGINA_PAGO = """<!doctype html><html lang="es"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Dynastia Analyst - Suscripcion</title>
+<script async src="https://js.stripe.com/v3/buy-button.js"></script>
 <style>
   body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
     background:#0a0e0f;color:#d9e4e2;font-family:-apple-system,sans-serif;text-align:center}
-  .caja{width:360px;padding:28px}
+  .caja{width:380px;padding:28px}
   h1{font-size:17px;margin:0 0 8px}
-  p{color:#8b93a3;font-size:13px;line-height:1.5;margin:0 0 22px}
-  a.btn{display:inline-block;background:#e8b64f;color:#0a0e0f;padding:12px 26px;
+  p.sub{color:#8b93a3;font-size:13px;line-height:1.5;margin:0 0 24px}
+  .boton{min-height:60px}
+  a.enlace{display:inline-block;background:#e8b64f;color:#0a0e0f;padding:12px 26px;
     border-radius:8px;text-decoration:none;font-size:14px;font-weight:600}
-  a.salir{display:block;margin-top:18px;color:#5f7876;font-size:12px}
+  .pie{margin-top:22px;color:#5f7876;font-size:12px}
+  .pie a{color:#5f7876}
+  .espera{color:#5f7876;font-size:12.5px;margin-top:16px;min-height:18px}
 </style></head><body>
 <div class="caja">
-  <h1>Falta activar tu suscripcion</h1>
-  <p>El acceso al terminal es de 30&euro; al mes. En cuanto Stripe confirma el
-     pago, entras al instante, sin tener que recargar nada.</p>
-  <a class="btn" href="__ENLACE__">Suscribirme por 30&euro;/mes</a>
-  <a class="salir" href="/logout">Cerrar sesion</a>
+  <h1>Activa tu suscripcion</h1>
+  <p class="sub">El acceso al terminal es de 30&euro; al mes. En cuanto Stripe
+     confirma el pago entras al instante, sin recargar nada.</p>
+  <div class="boton">__BOTON__</div>
+  <div class="espera" id="espera"></div>
+  <div class="pie"><a href="/logout">Cerrar sesion</a></div>
 </div>
+<script>
+// Tras pagar, Stripe vuelve a /pago/completado y el webhook ya habra
+// activado el acceso. Por si el aviso de Stripe tarda un par de segundos,
+// se consulta el estado hasta que entra, en vez de dar un error en seco.
+let intentos = 0;
+async function compruebaAcceso() {
+  try {
+    const r = await fetch("/api/acceso", { cache: "no-store" });
+    const d = await r.json();
+    if (d && d.pago) { location.href = "/"; return; }
+  } catch (e) { /* se reintenta */ }
+  if (++intentos < 40) setTimeout(compruebaAcceso, 3000);
+  else document.getElementById("espera").textContent =
+    "Si ya has pagado y sigues aqui, recarga la pagina en un minuto.";
+}
+if (location.search.includes("completado") || document.referrer.includes("stripe.com")) {
+  document.getElementById("espera").textContent = "Confirmando el pago con Stripe...";
+  compruebaAcceso();
+}
+</script>
 </body></html>"""
 
 
@@ -3549,12 +3591,28 @@ class Handler(SimpleHTTPRequestHandler):
         if ruta.path == "/pago":
             if not ses:
                 return self._redir("/login")
-            enlace = STRIPE["enlace"] + (("&" if "?" in STRIPE["enlace"] else "?")
-                                          + "client_reference_id=" + ses.get("id", ""))
-            return self._html(PAGINA_PAGO.replace("__ENLACE__", enlace))
+            uid = ses.get("id", "")
+            if stripe_boton_activo():
+                # El client-reference-id viaja con el pago y vuelve en el
+                # webhook, asi que el servidor sabe a quien activar.
+                boton = ('<stripe-buy-button buy-button-id="%s" publishable-key="%s"'
+                         ' client-reference-id="%s" customer-email="%s"></stripe-buy-button>'
+                         % (_escapa_attr(STRIPE["boton"]), _escapa_attr(STRIPE["publicable"]),
+                            _escapa_attr(uid), _escapa_attr(ses.get("email", ""))))
+            else:
+                enlace = STRIPE["enlace"] + (("&" if "?" in STRIPE["enlace"] else "?")
+                                              + "client_reference_id=" + uid)
+                boton = ('<a class="enlace" href="%s">Suscribirme por 30&euro;/mes</a>'
+                         % _escapa_attr(enlace))
+            return self._html(PAGINA_PAGO.replace("__BOTON__", boton))
 
         if ruta.path == "/pago/completado":
-            return self._redir("/")
+            # Stripe devuelve aqui tras cobrar. Si el webhook ya llego, se
+            # entra directo; si aun no, la pantalla de pago se queda
+            # consultando hasta que entre, sin dar un error en seco.
+            if ses and pago_activo(ses.get("id", "")):
+                return self._redir("/")
+            return self._redir("/pago?completado=1")
 
         if ruta.path == "/login":
             err = (parse_qs(ruta.query).get("e") or [""])[0]
@@ -3676,7 +3734,11 @@ class Handler(SimpleHTTPRequestHandler):
                                  "dominio": DISCORD["dominio"],
                                  "retorno": (DISCORD["dominio"] or _base_url(self))
                                             + "/auth/discord/callback",
-                                 "sesiones": len(SESIONES)})
+                                 "sesiones": len(SESIONES),
+                                 # Estado del muro de pago, que consulta la
+                                 # pantalla de espera tras volver de Stripe.
+                                 "stripe": stripe_activo(),
+                                 "pago": (not _requiere_pago(ses)) if ses else False})
 
         if ruta.path == "/api/marcadores":
             ses = sesion_de(self)
@@ -3884,12 +3946,18 @@ def main():
         print("              tickets https://discord.com/api/webhooks/...")
 
     if stripe_activo():
-        print("  Pago:       Stripe · 30E/mes · cuentas propias (sin Discord)")
-        print("              webhook: %s/stripe/webhook" % (DISCORD["dominio"] or retorno_local().replace("/auth/discord/callback", "")))
+        via = "boton embebido" if stripe_boton_activo() else "enlace de pago"
+        print("  Pago:       Stripe · 30E/mes · %s · %d suscripcion(es) activa(s)"
+              % (via, sum(1 for u in pagos_carga() if pago_activo(u))))
+        print("              webhook: %s/stripe/webhook"
+              % (DISCORD["dominio"] or retorno_local().replace("/auth/discord/callback", "")))
     else:
         print("  Pago:       SIN CONFIGURAR · anade en clave.txt:")
-        print("              stripe_enlace https://buy.stripe.com/...")
+        print("              stripe_boton buy_btn_...")
+        print("              stripe_publicable pk_live_...")
         print("              stripe_webhook whsec_...")
+        if STRIPE["boton"] and not STRIPE["webhook"]:
+            print("              (falta stripe_webhook: sin el, el cobro no activa el acceso)")
     avisos = revisa_discord()
     if discord_activo():
         print("  Acceso:     Discord · solo miembros del servidor %s" % DISCORD["guild"])
